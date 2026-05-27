@@ -1,0 +1,66 @@
+import requests
+
+# Test the full query that frontend uses
+url = "http://127.0.0.1:8000/graphql/"
+
+query = """
+query {
+  allProducts(first: 200) {
+    edges {
+      node {
+        id
+        name
+        slug
+        description
+        price
+        compareAtPrice
+        images {
+          edges {
+            node {
+              image
+              externalUrl
+              altText
+            }
+          }
+        }
+        category {
+          id
+          name
+          slug
+        }
+        vendor {
+          id
+          firstName
+          lastName
+          email
+          vendorProfile {
+            businessName
+            rating
+          }
+        }
+        averageRating
+        reviews(first: 100) {
+          edges {
+            node {
+              id
+            }
+          }
+        }
+        quantity
+        sku
+        status
+        createdAt
+      }
+    }
+  }
+}
+"""
+
+response = requests.post(url, json={"query": query})
+print(f"Status: {response.status_code}")
+result = response.json()
+if result.get('errors'):
+    print(f"Errors: {result['errors']}")
+else:
+    products = result.get('data', {}).get('allProducts', {}).get('edges', [])
+    print(f"Found {len(products)} products!")

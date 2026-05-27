@@ -1,0 +1,1 @@
+"""Migrations for cart service"""
