@@ -2,6 +2,8 @@
 Gateway Service - Unified GraphQL API
 Combines all microservices into a single GraphQL endpoint
 """
+import hmac
+import hashlib
 import graphene
 from graphene import ObjectType
 from django.conf import settings
@@ -26,6 +28,7 @@ from review_service.schema import ReviewQuery, ReviewMutation
 from chat_service.schema import ChatQuery, ChatMutation
 from wallet_service.schema import WalletQuery, WalletMutation
 from vendor_storefront.schema import StorefrontQuery, StorefrontMutation
+from card_vault.schema import CardVaultQuery, CardVaultMutation
 from order_service.models import Order
 from payment_service.models import Payment, Refund, VendorPayout
 from shipping_service.models import Shipment, ShipmentEvent
@@ -51,6 +54,7 @@ class Query(
     ChatQuery,
     WalletQuery,
     StorefrontQuery,
+    CardVaultQuery,
     ObjectType
 ):
     """Combined Query type from all services"""
@@ -98,6 +102,7 @@ class IntegrationMutation(graphene.ObjectType):
         event_type=graphene.String(required=True),
         payload=graphene.JSONString(required=True),
         token=graphene.String(required=False),
+        signature=graphene.String(required=False),
     )
     receive_shipping_webhook = graphene.Field(
         graphene.JSONString,
@@ -125,9 +130,21 @@ class IntegrationMutation(graphene.ObjectType):
     )
 
     @staticmethod
-    def _authorized(token):
-        """Internal helper function used by this module."""
-        expected = getattr(settings, "INTEGRATION_SHARED_TOKEN", "")
+    def _authorized(token, payload_str=None, signature=None):
+        """
+        Verify either HMAC-SHA256 signature or shared token.
+        HMAC takes priority when PAYMENT_WEBHOOK_HMAC_SECRET is configured.
+        """
+        hmac_secret = getattr(settings, 'PAYMENT_WEBHOOK_HMAC_SECRET', '')
+        if hmac_secret and payload_str and signature:
+            expected = hmac.new(
+                hmac_secret.encode('utf-8'),
+                payload_str.encode('utf-8'),
+                hashlib.sha256,
+            ).hexdigest()
+            return hmac.compare_digest(expected, signature)
+        # Fall back to shared token
+        expected = getattr(settings, 'INTEGRATION_SHARED_TOKEN', '')
         return (not expected) or (token == expected)
 
     @staticmethod
@@ -141,9 +158,10 @@ class IntegrationMutation(graphene.ObjectType):
             return json.loads(value)
         return value
 
-    def resolve_receive_payment_webhook(self, info, event_type, payload, token=None):
+    def resolve_receive_payment_webhook(self, info, event_type, payload,
+                                         token=None, signature=None):
         """Resolver for the GraphQL field `receive payment webhook`."""
-        if not self._authorized(token):
+        if not self._authorized(token, payload_str=payload, signature=signature):
             raise Exception("unauthorized")
         payload = self._obj(payload)
 
@@ -192,10 +210,51 @@ class IntegrationMutation(graphene.ObjectType):
         elif event_type == "VendorPayoutCompleted":
             payout = VendorPayout.objects.filter(pk=payload.get("payout_id")).first()
             if payout:
-                payout.status = "completed"
-                payout.bank_reference = payload.get("bank_reference", payout.bank_reference)
+                payout.status = "paid"
+                payout.payment_system_reference = payload.get("bank_reference", payout.payment_system_reference)
                 payout.processed_at = timezone.now()
-                payout.save(update_fields=["status", "bank_reference", "processed_at"])
+                payout.save(update_fields=["status", "payment_system_reference", "processed_at"])
+
+        elif event_type == "WalletTopUpCompleted":
+            # Confirm pending wallet top-up transaction and credit balance
+            from wallet_service.models import WalletTransaction, Wallet
+            from django.db.models import F
+            tx_id = payload.get("transaction_id")
+            if tx_id:
+                try:
+                    from django.db import transaction as db_tx
+                    with db_tx.atomic():
+                        tx = WalletTransaction.objects.select_for_update().get(
+                            pk=int(tx_id),
+                            status=WalletTransaction.TransactionStatus.PENDING,
+                            type=WalletTransaction.TransactionType.CREDIT,
+                        )
+                        Wallet.objects.filter(pk=tx.wallet_id).update(
+                            balance=F('balance') + tx.amount,
+                            updated_at=timezone.now(),
+                        )
+                        tx.status = WalletTransaction.TransactionStatus.COMPLETED
+                        tx.save(update_fields=['status'])
+                except WalletTransaction.DoesNotExist:
+                    pass
+
+        # Append-only audit log entry for every webhook event
+        try:
+            from card_vault.models import PaymentAuditLog
+            PaymentAuditLog.objects.create(
+                action=PaymentAuditLog.Action.PAYMENT_COMPLETED
+                       if event_type == "PaymentCompleted"
+                       else PaymentAuditLog.Action.PAYMENT_FAILED
+                       if event_type == "PaymentFailed"
+                       else PaymentAuditLog.Action.REFUND_REQUESTED
+                       if event_type == "RefundProcessed"
+                       else PaymentAuditLog.Action.PAYOUT_DISPATCHED,
+                resource_type='webhook',
+                resource_id=str(payload.get("transaction_id", "")),
+                metadata={"event_type": event_type, **{k: str(v) for k, v in payload.items()}},
+            )
+        except Exception:
+            pass  # Audit log failure must not block webhook processing
 
         return {"success": True, "event_type": event_type}
 
@@ -304,6 +363,7 @@ class Mutation(
     ChatMutation,
     WalletMutation,
     StorefrontMutation,
+    CardVaultMutation,
     IntegrationMutation,
     ObjectType
 ):

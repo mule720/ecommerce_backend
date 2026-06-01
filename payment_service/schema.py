@@ -9,7 +9,10 @@ from graphene_django.filter import DjangoFilterConnectionField
 from django_filters import FilterSet, CharFilter, NumberFilter
 from decimal import Decimal
 import uuid
-from .models import Payment, Refund, PaymentMethod, VendorPayout
+from .models import Payment, Refund, SavedPaymentMethod, VendorPayout, PaymentIdempotencyKey
+
+# Alias so existing schema code that references PaymentMethod still works
+PaymentMethod = SavedPaymentMethod
 from ecom_backend.event_bus import publish_event
 
 
@@ -152,32 +155,43 @@ class Query(graphene.ObjectType):
 
 # Mutations
 class ProcessPaymentMutation(graphene.Mutation):
-    """Process a payment for an order"""
+    """
+    Process a payment for an order.
+    Accepts an optional idempotency_key to prevent double-charges on retries.
+    For new purchases use completePurchase (checkout_service) instead — it is
+    fully atomic.  This mutation is kept for administrative/retry scenarios.
+    """
     class Arguments:
-        """Defines the purpose and behavior of the `Arguments` class."""
-        order_id = graphene.ID(required=True)
-        method = graphene.String(required=True)
-        gateway_name = graphene.String()
-    
+        order_id        = graphene.ID(required=True)
+        method          = graphene.String(required=True)
+        gateway_name    = graphene.String()
+        idempotency_key = graphene.String()
+
     payment = graphene.Field(PaymentType)
-    
+
     @classmethod
-    def mutate(cls, root, info, order_id, method, gateway_name='stripe'):
-        """Executes mutation business rules and returns the mutation response object."""
+    def mutate(cls, root, info, order_id, method, gateway_name='internal', idempotency_key=None):
         from order_service.models import Order
-        
+
         user = info.context.user
         if user.is_anonymous:
             raise Exception('Not logged in!')
-        
+
+        # Idempotency: return existing payment if this key was already processed
+        if idempotency_key:
+            existing = PaymentIdempotencyKey.objects.filter(
+                idempotency_key=idempotency_key, customer=user
+            ).select_related('payment').first()
+            if existing:
+                return ProcessPaymentMutation(payment=existing.payment)
+
         try:
             order = Order.objects.get(pk=int(order_id))
         except (Order.DoesNotExist, ValueError):
             raise Exception('Order not found')
-        
-        # Generate transaction ID
+
         transaction_id = f"TXN-{uuid.uuid4().hex[:12].upper()}"
-        
+
         payment = Payment.objects.create(
             order=order,
             customer=user,
@@ -185,22 +199,28 @@ class ProcessPaymentMutation(graphene.Mutation):
             method=method,
             transaction_id=transaction_id,
             gateway_name=gateway_name,
-            status='pending'
+            status='pending',
         )
 
-        # Delegate processing to Payment System via event bus
+        if idempotency_key:
+            PaymentIdempotencyKey.objects.create(
+                idempotency_key=idempotency_key,
+                payment=payment,
+                customer=user,
+            )
+
         publish_event('payment.events', 'PaymentRequested', {
-            'payment_id': str(payment.id),
+            'payment_id':     str(payment.id),
             'transaction_id': payment.transaction_id,
-            'order_id': str(order.id),
-            'order_number': order.order_number,
-            'customer_id': str(user.id),
-            'amount': str(order.total),
-            'currency': order.currency,
-            'method': method,
-            'gateway_name': gateway_name,
+            'order_id':       str(order.id),
+            'order_number':   order.order_number,
+            'customer_id':    str(user.id),
+            'amount':         str(order.total),
+            'currency':       order.currency,
+            'method':         method,
+            'gateway_name':   gateway_name,
         })
-        
+
         return ProcessPaymentMutation(payment=payment)
 
 

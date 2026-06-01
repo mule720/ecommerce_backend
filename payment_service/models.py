@@ -225,3 +225,29 @@ class VendorPayout(models.Model):
     def __str__(self):
         name = getattr(self.vendor, 'get_full_name', lambda: '')() or self.vendor.email
         return f"Payout {self.source_reference} → {name} | {self.gross_amount} {self.currency} [{self.status}]"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Idempotency Keys — prevent double-charges on network retries
+# ─────────────────────────────────────────────────────────────────────────────
+
+class PaymentIdempotencyKey(models.Model):
+    """
+    Stores the mapping from client-generated idempotency key to payment record.
+    If the same key is submitted again, the original Payment is returned
+    without creating a new charge.  Keys expire after 24 hours.
+    """
+    idempotency_key = models.CharField(max_length=64, unique=True, db_index=True)
+    payment         = models.OneToOneField(
+        Payment, on_delete=models.CASCADE, related_name='idempotency_record'
+    )
+    customer        = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='idempotency_keys'
+    )
+    created_at      = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'payment_idempotency_keys'
+
+    def __str__(self):
+        return f"IdempotencyKey({self.idempotency_key[:12]}…) → Payment#{self.payment_id}"

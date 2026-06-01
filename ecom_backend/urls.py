@@ -18,6 +18,14 @@ from ecom_backend.auth_views import (
     trigger_vendor_subscription_payment,
     request_password_reset,
 )
+from card_vault.crypto import get_rsa_public_key_pem
+from django.http import JsonResponse
+from payvault.webhook import payvault_webhook
+
+
+def payment_public_key_view(request):
+    """Return RSA public key for client-side card encryption. GET, no auth required."""
+    return JsonResponse({'publicKey': get_rsa_public_key_pem()})
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -40,6 +48,12 @@ urlpatterns = [
     path("api/vendor/subscription/select/", select_vendor_subscription, name="api_select_vendor_subscription"),
     path("api/vendor/subscription/payment/trigger/", trigger_vendor_subscription_payment, name="api_trigger_vendor_subscription_payment"),
     
+    # Payment public key (for browser-side card encryption)
+    path("api/payment/public-key/", payment_public_key_view, name="payment_public_key"),
+
+    # PayVault webhook (payment confirmation callbacks)
+    path("api/payvault/webhook/", payvault_webhook, name="payvault_webhook"),
+
     # Health check endpoint
     path("health/", lambda request: __import__('json'). dumps({"status": "ok"}), name="health"),
 ]

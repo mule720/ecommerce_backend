@@ -22,6 +22,98 @@ from .order_mutations import (
 # Note: Cart types are imported lazily in the Query class to avoid circular imports
 from product_service.inventory_ops import reserve_inventory_lines, release_inventory_lines
 from ecom_backend.event_bus import publish_event
+import logging
+import json
+import urllib.request
+import urllib.error
+
+logger = logging.getLogger(__name__)
+
+
+def _notify_integrated_services(order, order_payload, items_payload):
+    """
+    Fire-and-forget HTTP calls to payment, shipping and ERP services.
+    Runs in a background thread so it never blocks the order response.
+    """
+    from django.conf import settings
+
+    shared_token = getattr(settings, 'INTEGRATION_SHARED_TOKEN', '')
+    headers = {
+        'Content-Type': 'application/json',
+        'X-Internal-Token': shared_token,
+    }
+
+    # ── 1. Notify Payment System ────────────────────────────────────────────
+    payment_url = getattr(settings, 'PAYMENT_SYSTEM_WEBHOOK_URL', '')
+    if payment_url:
+        try:
+            payload = json.dumps({
+                'event': 'order_placed',
+                'order_id': str(order.id),
+                'order_number': order.order_number,
+                'amount': str(order.total),
+                'currency': order.currency,
+                'customer_email': order.shipping_email if hasattr(order, 'shipping_email') else '',
+            }).encode()
+            req = urllib.request.Request(
+                f'{payment_url}/api/webhooks/order-placed/',
+                data=payload, headers=headers, method='POST',
+            )
+            urllib.request.urlopen(req, timeout=5)
+            logger.info('Payment system notified for order %s', order.order_number)
+        except Exception as exc:
+            logger.warning('Could not notify payment system: %s', exc)
+
+    # ── 2. Notify Shipping System ───────────────────────────────────────────
+    shipping_url = getattr(settings, 'SHIPPING_SYSTEM_WEBHOOK_URL', '')
+    if shipping_url:
+        try:
+            payload = json.dumps({
+                'event': 'order_placed',
+                'order_id': str(order.id),
+                'order_number': order.order_number,
+                'sender_name': 'Ecommerce Warehouse',
+                'sender_address': getattr(settings, 'WAREHOUSE_ADDRESS', ''),
+                'recipient_name': f"{order.shipping_first_name} {order.shipping_last_name}",
+                'recipient_address': order.shipping_address,
+                'recipient_phone': order.shipping_phone if hasattr(order, 'shipping_phone') else '',
+                'recipient_city': order.shipping_city,
+                'weight': sum(
+                    float(item.get('weight', 0.5)) * item.get('quantity', 1)
+                    for item in items_payload
+                ),
+                'items': items_payload,
+            }).encode()
+            req = urllib.request.Request(
+                f'{shipping_url}/api/webhooks/order-placed/',
+                data=payload, headers=headers, method='POST',
+            )
+            urllib.request.urlopen(req, timeout=5)
+            logger.info('Shipping system notified for order %s', order.order_number)
+        except Exception as exc:
+            logger.warning('Could not notify shipping system: %s', exc)
+
+    # ── 3. Notify ERP System ────────────────────────────────────────────────
+    erp_url = getattr(settings, 'ERP_SYSTEM_WEBHOOK_URL', '')
+    if erp_url:
+        try:
+            payload = json.dumps({
+                'event': 'order_placed',
+                'order_id': str(order.id),
+                'order_number': order.order_number,
+                'subtotal': str(order.subtotal),
+                'total': str(order.total),
+                'currency': order.currency,
+                'items': items_payload,
+            }).encode()
+            req = urllib.request.Request(
+                f'{erp_url}/api/webhooks/ecommerce-order/',
+                data=payload, headers=headers, method='POST',
+            )
+            urllib.request.urlopen(req, timeout=5)
+            logger.info('ERP system notified for order %s', order.order_number)
+        except Exception as exc:
+            logger.warning('Could not notify ERP system: %s', exc)
 
 
 def _decode_graphql_id(value):
@@ -478,10 +570,19 @@ class CreateOrderFromCartMutation(graphene.Mutation):
                 'lines': reservation_lines,
             })
         
-        # Batch all remaining events (3 instead of separate calls)
+        # Publish events to RabbitMQ
         for queue in ['payment.events', 'shipping.events', 'erp.events']:
             publish_event(queue, 'OrderPlaced', order_payload)
-        
+
+        # ── Direct HTTP notifications to integrated services ──────────────
+        # These are fire-and-forget: a failure must not block the order response.
+        import threading
+        threading.Thread(
+            target=_notify_integrated_services,
+            args=(order, order_payload, items_payload),
+            daemon=True,
+        ).start()
+
         return CreateOrderFromCartMutation(
             order=order,
             success=True,

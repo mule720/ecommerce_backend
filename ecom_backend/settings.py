@@ -15,21 +15,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-4q0yzei=7pb#6t!!ci347omfcz^au!63yrgcod-eo1!it0y7*='
+SECRET_KEY = os.environ.get(
+    'SECRET_KEY',
+    'django-insecure-4q0yzei=7pb#6t!!ci347omfcz^au!63yrgcod-eo1!it0y7*='
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = os.environ.get('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = ['*']
+ALLOWED_HOSTS = os.environ.get('ALLOWED_HOSTS', '*').split(',') if os.environ.get('ALLOWED_HOSTS') else (['*'] if DEBUG else ['localhost'])
 
 # CSRF trusted origins - required for cross-origin requests from frontend
-CSRF_TRUSTED_ORIGINS = [
+_csrf_env = os.environ.get('CSRF_TRUSTED_ORIGINS', '')
+CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_env.split(',') if o.strip()] or [
+    'http://localhost:3003',   # ecom frontend (Docker)
+    'http://localhost:8003',   # ecom backend direct
     'http://localhost:3000',
-    'http://localhost:5173', 
+    'http://localhost:5173',
     'http://localhost:8080',
-    'http://127.0.0.1:3000',
-    'http://127.0.0.1:5173',
-    'http://127.0.0.1:8080',
+    'http://127.0.0.1:3003',
+    'http://127.0.0.1:8003',
 ]
 
 
@@ -65,6 +70,8 @@ INSTALLED_APPS = [
     'wallet_service',
     'gateway_service',
     'vendor_storefront',
+    'card_vault',
+    'django_celery_beat',
 ]
 
 MIDDLEWARE = [
@@ -104,10 +111,15 @@ WSGI_APPLICATION = 'ecom_backend.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
+import os as _os
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': _os.environ.get('POSTGRES_DB', 'ecommerce_db'),
+        'USER': _os.environ.get('POSTGRES_USER', 'postgres'),
+        'PASSWORD': _os.environ.get('POSTGRES_PASSWORD', 'postgres'),
+        'HOST': _os.environ.get('POSTGRES_HOST', 'localhost'),
+        'PORT': _os.environ.get('POSTGRES_PORT', '5432'),
     }
 }
 
@@ -178,16 +190,10 @@ GRAPHQL_JWT = {
     'JWT_ALGORITHM': 'HS256',
 }
 
-# CORS Settings
-CORS_ALLOW_ALL_ORIGINS = True
+# CORS Settings — open in dev, restricted in production
+CORS_ALLOW_ALL_ORIGINS = DEBUG   # False in production — must set CORS_ALLOWED_ORIGINS env var
 CORS_ALLOW_CREDENTIALS = True
-
-# CORS_ALLOWED_ORIGINS = [
-#     'http://localhost:3000',
-#     'http://localhost:5173',
-#     'http://127.0.0.1:3000',
-#     'http://127.0.0.1:5173',
-# ]
+CORS_ALLOWED_ORIGINS = os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if not DEBUG else []
 
 # Service URLs (for inter-service communication)
 SERVICE_URLS = {
@@ -199,11 +205,36 @@ SERVICE_URLS = {
     'notification_service': 'http://localhost:8006',
 }
 
+# ===================
+# PCI DSS — Card Vault
+# ===================
+# Set both vars from a secrets manager or HSM in production.
+# In dev the system auto-generates ephemeral values with a warning.
+
+# RSA-2048 private key (PEM) used to decrypt card payloads from the browser.
+# Generate with:  openssl genrsa -out card_vault_rsa.pem 2048
+CARD_VAULT_RSA_PRIVATE_KEY_PEM = os.environ.get('CARD_VAULT_RSA_PRIVATE_KEY_PEM', '')
+
+# AES-256 master key as a 64-char hex string (32 bytes).
+# Generate with:  python -c "import secrets; print(secrets.token_hex(32))"
+CARD_VAULT_MASTER_KEY_HEX = os.environ.get('CARD_VAULT_MASTER_KEY_HEX', '')
+
+# ===================
+# Webhook Security
+# ===================
+# HMAC-SHA256 secret shared with your external payment system.
+# Webhook payloads signed with this secret are accepted without a shared token.
+PAYMENT_WEBHOOK_HMAC_SECRET = os.environ.get('PAYMENT_WEBHOOK_HMAC_SECRET', '')
+
 # External system integration endpoints/tokens
-PAYMENT_SYSTEM_WEBHOOK_URL = os.environ.get('PAYMENT_SYSTEM_WEBHOOK_URL', 'http://localhost:8010')
-SHIPPING_SYSTEM_WEBHOOK_URL = os.environ.get('SHIPPING_SYSTEM_WEBHOOK_URL', 'http://localhost:8020')
-ERP_SYSTEM_WEBHOOK_URL = os.environ.get('ERP_SYSTEM_WEBHOOK_URL', 'http://localhost:8030')
-INTEGRATION_SHARED_TOKEN = os.environ.get('INTEGRATION_SHARED_TOKEN', '')
+# Correct default ports match the docker-compose port mapping:
+#   payment_backend → 8005, shipping_backend → 8002, erp_backend → 8004
+PAYMENT_SYSTEM_WEBHOOK_URL  = os.environ.get('PAYMENT_SYSTEM_WEBHOOK_URL',  'http://localhost:8005')
+SHIPPING_SYSTEM_WEBHOOK_URL = os.environ.get('SHIPPING_SYSTEM_WEBHOOK_URL', 'http://localhost:8002')
+ERP_SYSTEM_WEBHOOK_URL      = os.environ.get('ERP_SYSTEM_WEBHOOK_URL',      'http://localhost:8004')
+# INTEGRATION_SHARED_TOKEN must match gateway's INTEGRATION_SHARED_TOKEN env var.
+INTEGRATION_SHARED_TOKEN = os.environ.get('INTEGRATION_SHARED_TOKEN', 'change-me-in-production-use-32-char-secret')
+WAREHOUSE_ADDRESS = os.environ.get('WAREHOUSE_ADDRESS', '1 Warehouse Road, Industrial Area')
 
 # Logging
 LOGGING = {
@@ -354,3 +385,11 @@ CELERY_BEAT_SCHEDULE = {
 }
 
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+
+# ── PayVault Integration ───────────────────────────────────────────────────────
+# Set these to point at the PayVault service.
+# Obtain API key from the PayVault merchant dashboard.
+PAYVAULT_BASE_URL       = ''   # e.g. 'https://payvault.yourdomain.com'
+PAYVAULT_API_KEY_ID     = ''
+PAYVAULT_API_SECRET     = ''
+PAYVAULT_WEBHOOK_SECRET = ''   # Must match the secret registered in PayVault merchant
